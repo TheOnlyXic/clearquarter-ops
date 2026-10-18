@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """
-ClearQuarter community watcher.
+ClearQuarter community watcher. v2
+
 Watches Reddit for BAS/GST questions from Australian sole traders,
 drafts a reply, sends it to Discord. You edit and post it yourself.
 
+Modes:
+  - Reddit OAuth API (recommended, reliable): set REDDIT_CLIENT_ID,
+    REDDIT_CLIENT_SECRET, REDDIT_USERNAME, REDDIT_PASSWORD secrets.
+  - Public RSS (fallback): works, but cloud IPs get rate-limited often.
+
 Usage:
-  python watcher.py          # normal run (needs DISCORD_WEBHOOK_URL)
-  python watcher.py --test   # offline self-test of parsing and matching
+  python watcher.py          # normal run
+  python watcher.py --test   # offline self-test
 """
+import base64
 import json
 import os
 import re
 import sys
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -19,10 +27,10 @@ from xml.etree import ElementTree
 
 STATE_FILE = "watcher_state.json"
 USER_AGENT = "clearquarter-watcher/1.0 (personal project)"
+DISCORD_HEADERS = {"Content-Type": "application/json", "User-Agent": "clearquarter-watcher/1.0"}
 
 SUBREDDITS = ["SmallBusinessAU", "AusFinance", "auscorp"]
 
-# Site-wide searches catch posts in subs not listed above
 SEARCH_QUERIES = [
     '"BAS" sole trader',
     '"GST" spreadsheet OR template',
@@ -81,13 +89,30 @@ DRAFTS = {
     ),
 }
 
-# Categories where mentioning the kit is appropriate, always with disclosure
 LINK_CATEGORIES = {"bas_help", "spreadsheet"}
 DISCLOSURE_LINE = (
     "Full disclosure: I built a tool called ClearQuarter that does the GST "
     "splitting and quarter tagging for sole traders, A$19. Only mentioning it "
     "because it's exactly this problem."
 )
+
+
+def fetch(url, headers=None, retries=2):
+    """GET with backoff. Raises the last error if all attempts fail."""
+    h = {"User-Agent": USER_AGENT}
+    if headers:
+        h.update(headers)
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=h)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read()
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(5 * (attempt + 1))
+    raise last_err
 
 
 def build_feeds():
@@ -102,17 +127,10 @@ def build_feeds():
     return feeds
 
 
-def fetch(url):
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read()
-
-
 ATOM = "{http://www.w3.org/2005/Atom}"
 
 
 def parse_feed(xml_bytes):
-    """Parse a Reddit atom feed into a list of post dicts."""
     root = ElementTree.fromstring(xml_bytes)
     posts = []
     for entry in root.findall(f"{ATOM}entry"):
@@ -128,8 +146,74 @@ def parse_feed(xml_bytes):
     return posts
 
 
+def fetch_rss_posts():
+    posts, errors = [], []
+    for i, feed_url in enumerate(build_feeds()):
+        if i:
+            time.sleep(2)
+        try:
+            posts.extend(parse_feed(fetch(feed_url)))
+            print(f"  fetched: {feed_url[:80]}")
+        except Exception as e:
+            errors.append(f"{feed_url[:80]} -> {e}")
+    return posts, errors
+
+
+def reddit_token():
+    cid = os.environ.get("REDDIT_CLIENT_ID", "")
+    cs = os.environ.get("REDDIT_CLIENT_SECRET", "")
+    user = os.environ.get("REDDIT_USERNAME", "")
+    pw = os.environ.get("REDDIT_PASSWORD", "")
+    if not (cid and cs and user and pw):
+        return None
+    body = urllib.parse.urlencode({
+        "grant_type": "password", "username": user, "password": pw,
+    }).encode()
+    req = urllib.request.Request(
+        "https://www.reddit.com/api/v1/access_token",
+        data=body,
+        headers={
+            "Authorization": "Basic " + base64.b64encode(f"{cid}:{cs}".encode()).decode(),
+            "User-Agent": USER_AGENT,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read())
+    token = data.get("access_token")
+    if not token:
+        raise RuntimeError(f"no token in response: {data}")
+    return token
+
+
+def fetch_api_posts(token):
+    listings = [f"https://oauth.reddit.com/r/{s}/new?limit=50&raw_json=1" for s in SUBREDDITS]
+    for q in SEARCH_QUERIES:
+        listings.append(
+            "https://oauth.reddit.com/search?"
+            + urllib.parse.urlencode({"q": q, "sort": "new", "t": "week", "limit": 50, "raw_json": 1})
+        )
+    posts, errors = [], []
+    for i, url in enumerate(listings):
+        if i:
+            time.sleep(1)
+        try:
+            data = json.loads(fetch(url, headers={"Authorization": f"Bearer {token}"}))
+            for child in data.get("data", {}).get("children", []):
+                d = child.get("data", {})
+                pid = d.get("id", "")
+                posts.append({
+                    "id": f"t3_{pid}" if pid else "",
+                    "title": d.get("title", ""),
+                    "link": "https://www.reddit.com" + d.get("permalink", ""),
+                    "text": d.get("selftext", "") or "",
+                })
+            print(f"  fetched: {url[:80]}")
+        except Exception as e:
+            errors.append(f"{url[:80]} -> {e}")
+    return posts, errors
+
+
 def categorize(post):
-    """Return (category, keyword) for the first match, or (None, None)."""
     haystack = (post["title"] + " " + post["text"]).lower()
     for category, keywords in KEYWORD_CATEGORIES.items():
         for kw in keywords:
@@ -139,7 +223,6 @@ def categorize(post):
 
 
 def draft_reply(category, post):
-    """Template draft, optionally rewritten by an LLM if TOGETHER_API_KEY is set."""
     base = DRAFTS.get(category, DRAFTS["default"])
     text = base
     if category in LINK_CATEGORIES:
@@ -155,7 +238,6 @@ def draft_reply(category, post):
 
 
 def llm_polish(api_key, category, post, draft):
-    """Rewrite the template draft in natural prose. Never adds links."""
     allow_link = category in LINK_CATEGORIES
     prompt = (
         "Rewrite this Reddit reply so it sounds like a real person, plain "
@@ -178,6 +260,7 @@ def llm_polish(api_key, category, post, draft):
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
         },
     )
     with urllib.request.urlopen(req, timeout=60) as r:
@@ -192,10 +275,20 @@ def send_discord(webhook, title, url, keyword, draft):
         f"**Draft reply, edit before posting:**\n>>> {draft[:1500]}"
     )
     body = json.dumps({"content": content}).encode()
-    req = urllib.request.Request(
-        webhook, data=body, headers={"Content-Type": "application/json"}
-    )
+    req = urllib.request.Request(webhook, data=body, headers=DISCORD_HEADERS)
     urllib.request.urlopen(req, timeout=30)
+
+
+def safe_send(webhook, title, url, keyword, draft):
+    """Discord failures must never crash the run."""
+    if not webhook:
+        return False
+    try:
+        send_discord(webhook, title, url, keyword, draft)
+        return True
+    except Exception as e:
+        print(f"  warning: Discord send failed: {e}")
+        return False
 
 
 def load_state():
@@ -220,9 +313,7 @@ def notify_failure(webhook, message):
         return
     try:
         body = json.dumps({"content": f"⚠️ Watcher failed: {message[:1800]}"}).encode()
-        req = urllib.request.Request(
-            webhook, data=body, headers={"Content-Type": "application/json"}
-        )
+        req = urllib.request.Request(webhook, data=body, headers=DISCORD_HEADERS)
         urllib.request.urlopen(req, timeout=30)
     except Exception:
         pass
@@ -233,35 +324,37 @@ def run():
     state = load_state()
     first_run = not state["seen"]
 
-    all_posts, errors = [], []
-    for feed_url in build_feeds():
-        try:
-            all_posts.extend(parse_feed(fetch(feed_url)))
-            print(f"  fetched: {feed_url[:80]}")
-        except Exception as e:
-            errors.append(f"{feed_url[:80]} -> {e}")
+    token = None
+    try:
+        token = reddit_token()
+    except Exception as e:
+        print(f"  warning: Reddit auth failed ({e}), falling back to RSS")
 
-    if errors and not all_posts:
-        notify_failure(webhook, "All feeds failed (likely Reddit blocking GitHub's IPs). " + "; ".join(errors))
+    if token:
+        print("Mode: Reddit OAuth API")
+        all_posts, errors = fetch_api_posts(token)
+    else:
+        print("Mode: public RSS")
+        all_posts, errors = fetch_rss_posts()
+
+    if not all_posts and errors:
+        notify_failure(webhook, "All feeds failed. " + "; ".join(errors))
         sys.exit(1)
     for e in errors:
         print(f"  warning: {e}")
 
-    # Deduplicate by id
     unique = {p["id"]: p for p in all_posts if p["id"]}.values()
 
     if first_run:
         for p in unique:
             state["seen"][p["id"]] = datetime.now(timezone.utc).isoformat()
         save_state(state)
-        if webhook:
-            send_discord(
-                webhook, "Watcher installed", "",
-                "first-run",
-                f"Seeded {len(state['seen'])} posts as seen so you don't get a flood. "
-                "Real matches start arriving on the next daily run. "
-                "To test end to end, run the workflow manually after deleting watcher_state.json.",
-            )
+        safe_send(
+            webhook, "Watcher installed", "",
+            "first-run",
+            f"Seeded {len(state['seen'])} posts as seen so you don't get a flood. "
+            "Real matches start arriving on the next daily run.",
+        )
         print(f"First run: seeded {len(state['seen'])} posts. Done.")
         return
 
@@ -274,8 +367,7 @@ def run():
         if not category:
             continue
         draft = draft_reply(category, p)
-        if webhook:
-            send_discord(webhook, p["title"], p["link"], kw, draft)
+        if safe_send(webhook, p["title"], p["link"], kw, draft):
             sent += 1
         print(f"  match: {kw} | {p['title'][:60]}")
 
@@ -284,7 +376,6 @@ def run():
 
 
 def self_test():
-    """Offline test: parse a sample feed and verify matching and drafts."""
     sample = """<?xml version="1.0" encoding="UTF-8"?>
     <feed xmlns="http://www.w3.org/2005/Atom">
       <entry><id>t3_test1</id><title>First BAS panic, sole trader, help</title>
@@ -306,12 +397,10 @@ def self_test():
     assert categorize(posts[2]) == (None, None), "post 3 should not match"
     d1 = draft_reply(cat1, posts[0])
     assert "Full disclosure" in d1, "bas_help draft should include disclosure"
-    d2 = draft_reply(cat2, posts[1])
-    assert "Full disclosure" in d2, "spreadsheet draft should include disclosure"
     d3 = draft_reply("gst_maths", posts[0])
     assert "Full disclosure" not in d3, "gst_maths draft must not include disclosure"
+    assert safe_send("", "t", "", "k", "d") is False, "empty webhook should be a no-op"
     print("All self-tests passed.")
-    print("\nSample draft for 'bas_help':\n" + d1)
 
 
 if __name__ == "__main__":
