@@ -1,0 +1,32 @@
+name: community-watcher
+
+on:
+  schedule:
+    - cron: "0 9 * * *"   # 9am UTC daily = evening Sydney time
+  workflow_dispatch:       # manual run button, for testing
+
+permissions:
+  contents: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run watcher
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+        run: python watcher.py
+
+      - name: Commit seen-posts state
+        run: |
+          git config user.name "watcher-bot"
+          git config user.email "actions@github.com"
+          git add watcher_state.json
+          git diff --cached --quiet || (git commit -m "watcher: update state" && git push)
