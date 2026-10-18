@@ -12,10 +12,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Create Pages project if missing
-        run: npx wrangler@3 pages project create clearquarter --production-branch=main || true
+        run: |
+          npx wrangler@3 pages project create clearquarter-site --production-branch=main \
+            || echo "Create step failed or project already exists. Check message above."
 
       - name: Deploy to Cloudflare Pages
-        run: npx wrangler@3 pages deploy . --project-name=clearquarter --branch=main
+        run: npx wrangler@3 pages deploy . --project-name=clearquarter-site --branch=main
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
