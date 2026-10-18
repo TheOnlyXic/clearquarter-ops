@@ -2,8 +2,8 @@ name: community-watcher
 
 on:
   schedule:
-    - cron: "0 9 * * *"   # 9am UTC daily = evening Sydney time
-  workflow_dispatch:       # manual run button, for testing
+    - cron: "0 9 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -22,11 +22,18 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          REDDIT_USERNAME: ${{ secrets.REDDIT_USERNAME }}
+          REDDIT_PASSWORD: ${{ secrets.REDDIT_PASSWORD }}
         run: python watcher.py
 
       - name: Commit seen-posts state
+        if: always()
         run: |
-          git config user.name "watcher-bot"
-          git config user.email "actions@github.com"
-          git add watcher_state.json
-          git diff --cached --quiet || (git commit -m "watcher: update state" && git push)
+          if [ -f watcher_state.json ]; then
+            git config user.name "watcher-bot"
+            git config user.email "actions@github.com"
+            git add watcher_state.json
+            git diff --cached --quiet || (git commit -m "watcher: update state" && git push)
+          fi
