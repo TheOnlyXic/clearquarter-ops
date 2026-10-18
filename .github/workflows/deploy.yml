@@ -1,33 +1,50 @@
-name: Deploy site
+name: Deploy to Cloudflare Pages
 
 on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-deploy
+  cancel-in-progress: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Wrangler
+        run: npm install -g wrangler@3
+
       - name: Create Pages project if missing
-        run: |
-          npx wrangler@3 pages project create clearquarter-site --production-branch=main \
-            || echo "Create step failed or project already exists. Check message above."
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          wrangler pages project create clearquarter-site --production-branch=main \
+            || echo "Project already exists, skipping creation"
 
       - name: Deploy to Cloudflare Pages
-        run: npx wrangler@3 pages deploy . --project-name=clearquarter-site --branch=main
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: wrangler pages deploy . --project-name=clearquarter-site --branch=main
 
-      - name: Alert Discord if deploy failed
+      - name: Notify Discord on failure
         if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           curl -sf -X POST -H "Content-Type: application/json" \
-            -d '{"content":"ClearQuarter site deploy FAILED. Details: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' \
-            "${{ secrets.DISCORD_WEBHOOK_URL }}"
+            -d '{"content": "❌ Deploy failed for clearquarter-site. Logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' \
+            "$DISCORD_WEBHOOK_URL"
